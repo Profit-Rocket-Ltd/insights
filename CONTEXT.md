@@ -69,6 +69,12 @@ _Avoid_: warehouse (implementation file name only)
 **Table Import**:
 The sync job that copies a source table into the Data Store.
 
+**Unexplained Orphan**:
+A Data Store table the weekly cleanup cannot show to be rebuildable. The cleanup
+keeps it and raises an `Error Log`. See the cleanup ADR,
+`docs/adr/the-cleanup-deletes-only-what-it-can-rebuild.md`.
+_Avoid_: unknown table, stray table
+
 ### Framework integration
 
 **Island**:
@@ -86,11 +92,12 @@ A strict ladder: `Private | Specific Roles | Everyone | Public`, declared as
 fields on the content. View-only; editing is governed separately.
 _Avoid_: sharing (person-level DocShare is the `Private` rung, not a separate axis)
 
-**Data Authority**:
-Whose permissions filter a chart's rows at execution: `Viewer` (default — the
-engine applies the viewer's role and user permissions) or `Author` (whole
-numbers, audience-curated). Declared on the content, enforced by the engine.
-_Avoid_: permission mode, run-as
+**Permission User**:
+Whose permissions filter the rows an execution returns, when the caller's own
+cannot. A public link runs as Guest, a preview as Guest with a key, an alert as
+Administrator — so each names a user, recorded on the content when it was
+published or enabled. Empty means the viewer decides the rows.
+_Avoid_: data authority, permission mode, run-as, impersonation
 
 **Team**:
 A named group of users that grants access to resources (data sources, tables).
@@ -103,5 +110,10 @@ A pre-built workbook shipped by any installed app via the `insights_workbook_tem
 hook; imported as one shared, Administrator-owned copy per site.
 
 **Alert**:
-A scheduled check on a query's results that notifies recipients (email or Telegram)
-when its condition is met.
+A scheduled check on a query's results that notifies recipients over a channel when its
+condition is met.
+
+**Channel**:
+How an alert reaches its recipients: email, Telegram or a webhook. A webhook posts to a
+URL the user supplies, which is why outbound requests carry an address policy — see
+`docs/adr/outbound-http-to-user-chosen-urls.md`.
