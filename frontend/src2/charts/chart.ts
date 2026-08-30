@@ -443,6 +443,10 @@ function makeChart(name: string) {
 		return `${window.location.origin}${href}`
 	}
 
+	function updateAccess(is_public: boolean) {
+		return chart.call('update_access', { is_public }).then(() => chart.load())
+	}
+
 	function getDependentQueries() {
 		return [chart.doc.query, ...getLinkedQueries(chart.doc.query)]
 	}
@@ -549,6 +553,7 @@ function makeChart(name: string) {
 		resetConfig,
 
 		getShareLink,
+		updateAccess,
 
 		getDependentQueries,
 		getDependentQueryColumns,
@@ -633,6 +638,12 @@ function transformChartDoc(doc: any) {
 
 	doc.config = setDimensionNames(doc.config)
 	doc.config = ensureConfigSlots(doc.config, doc.chart_type)
+
+	// The bar config form writes this default when it mounts, which leaves a
+	// freshly opened chart dirty. Set it on load instead.
+	if (doc.chart_type === 'Bar' && doc.config.y_axis.stack === undefined) {
+		doc.config.y_axis.stack = true
+	}
 
 	return doc
 }

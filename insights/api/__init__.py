@@ -6,9 +6,10 @@ import os
 import frappe
 from frappe.handler import is_valid_http_method, is_whitelisted
 from frappe.monitor import add_data_to_monitor
+from frappe.utils import cint
 
-from insights.api.shared import is_public
-from insights.decorators import insights_whitelist, validate_type
+from insights.api.shared import get_public_permission_user, is_public
+from insights.decorators import insights_whitelist
 from insights.insights.doctype.insights_data_source_v3.ibis_utils import (
     get_columns_from_schema,
 )
@@ -18,12 +19,51 @@ from insights.insights.doctype.insights_table_v3.insights_table_v3 import (
 from insights.insights.doctype.insights_team.insights_team import (
     check_data_source_permission,
 )
+from insights.permission_user import permission_user
 from insights.utils import get_owned_file
 
 
 @insights_whitelist()
 def get_app_version():
     return frappe.get_attr("insights" + ".__version__")
+
+
+@frappe.whitelist(allow_guest=True)  # nosemgrep - the payload is the site's currency and
+# country, which a public dashboard already prints
+def get_site_info():
+    """Settings of the site, not of whoever reads it. A guest opening a public
+    dashboard needs them to print an amount the way the workbook does."""
+    return {
+        "country": frappe.db.get_single_value("System Settings", "country"),
+        **get_currency_info(),
+    }
+
+
+def get_currency_info():
+    """The site's display currency, as the client needs it to print an amount.
+
+    The `currency` global default covers a site with ERPNext and one without:
+    ERPNext's Global Defaults writes `default_currency` into it, and plain Frappe
+    writes `System Settings.currency` into it. `hide_currency_symbol` empties the
+    symbol, which is how a site says amounts print bare.
+    """
+    # System Settings writes the default only when the field changes, so read the
+    # field too — a site installed with a currency has never "changed" it
+    currency = frappe.db.get_default("currency") or frappe.db.get_single_value("System Settings", "currency")
+    if not currency:
+        return {"currency": None, "currency_symbol": "", "currency_symbol_on_right": False}
+
+    hidden = cint(frappe.defaults.get_global_default("hide_currency_symbol"))
+    symbol, on_right = frappe.db.get_value("Currency", currency, ["symbol", "symbol_on_right"]) or (
+        None,
+        None,
+    )
+    return {
+        "currency": currency,
+        # a currency with no symbol of its own prints as its code, the way fmt_money does
+        "currency_symbol": "" if hidden else (symbol or currency),
+        "currency_symbol_on_right": bool(on_right),
+    }
 
 
 @insights_whitelist()
@@ -51,8 +91,6 @@ def get_user_info():
         "is_admin": is_admin,
         "is_user": is_user or frappe.session.user == "Administrator",
         "can_download": is_admin or bool(frappe.db.get_single_value("Insights Settings", "allow_download")),
-        # TODO: move to `get_session_info` since not user specific
-        "country": frappe.db.get_single_value("System Settings", "country"),
         "locale": locale,
         "has_desk_access": user.get("user_type") == "System User",
         "has_demo_data": has_demo_data,
@@ -88,7 +126,6 @@ def create_uploads_if_not_exists():
 
 
 @insights_whitelist()
-@validate_type
 def get_file_data(filename: str):
     check_data_source_permission("uploads")
 
@@ -120,7 +157,6 @@ def get_file_data(filename: str):
 
 
 @insights_whitelist()
-@validate_type
 def import_csv_data(filename: str, tablename: str = ""):
     check_data_source_permission("uploads")
 
@@ -169,8 +205,8 @@ def _read_uploaded_table(db, file_path: str, ext: str):
         frappe.throw("Failed to read CSV data from uploaded file. Please try again.")
 
 
-@frappe.whitelist(allow_guest=True)
-@validate_type
+@frappe.whitelist(allow_guest=True)  # nosemgrep - falls back to is_public() only after the
+# framework has already refused the caller
 def get_doc(doctype: str, name: str | int):
     try:
         from frappe.client import get as _get_doc
@@ -179,7 +215,12 @@ def get_doc(doctype: str, name: str | int):
     except frappe.PermissionError:
         if not is_public(doctype, name):
             raise
-        return frappe.get_doc(doctype, name).as_dict()
+        doc = frappe.get_doc(doctype, name)
+        # the framework's own read path drops permlevel fields, and this branch
+        # goes around it. `permission_user` names a real person, so a public
+        # document must not carry it out to the internet.
+        doc.apply_fieldlevel_read_permissions()
+        return doc.as_dict()
 
 
 def _execute_doc_method(doc, method: str, args: dict | None = None, ignore_permissions=False):
@@ -200,16 +241,34 @@ def _execute_doc_method(doc, method: str, args: dict | None = None, ignore_permi
     return response
 
 
-@frappe.whitelist(allow_guest=True)
+def check_stored_document(doctype: str, name: str):
+    """Decide access against the stored document, not the caller's copy of it.
+
+    A method runs on a document built from the request body, so every field the
+    permission rules read is whatever the caller sent. A name with no row behind
+    it is a document the client has not saved, and discloses nothing.
+    """
+    if not frappe.db.exists(doctype, name):
+        return
+
+    if not frappe.has_permission(doctype, ptype="read", doc=name):
+        raise frappe.PermissionError("You don't have permission to access this document")
+
+
+@frappe.whitelist(allow_guest=True)  # nosemgrep - guests reach only public documents, and only
+# the methods and arguments PUBLIC_METHOD_ARGS names
 def run_doc_method(method: str, docs: dict | str, args: dict | None = None):
     doc = frappe.parse_json(docs)
     doctype = doc.get("doctype")
     name = doc.get("name")
 
-    if not doctype or not name:
+    # a name is one document's identity. A dict is a filter set to `frappe.db`,
+    # so it is not a name.
+    if not doctype or not name or not isinstance(name, str):
         raise frappe.ValidationError("Invalid document")
 
     try:
+        check_stored_document(doctype, name)
         docs = frappe.parse_json(docs)
         doc = frappe.get_doc(docs)
         return _execute_doc_method(doc, method, args)
@@ -220,21 +279,42 @@ def run_doc_method(method: str, docs: dict | str, args: dict | None = None):
         if not is_public_method(doctype, method):
             raise frappe.PermissionError("You don't have permission to access this method")
 
+        # the caller is a Guest with no permissions of its own, so the rows come
+        # back filtered by the user the publisher recorded - not unfiltered.
         doc = frappe.get_doc(doctype, name)
-        frappe.flags.insights_for_public_access = True
-        try:
-            return _execute_doc_method(doc, method, args, ignore_permissions=True)
-        finally:
-            frappe.flags.insights_for_public_access = False
+        with permission_user(get_public_permission_user(doctype, name)):
+            return _execute_doc_method(
+                doc, method, public_method_args(doctype, method, args), ignore_permissions=True
+            )
+
+
+# A public execution runs what the publisher published, so the public surface is
+# a set of parameter names, not a set of method names. The query builder passes
+# its own parameters to these methods - `active_operation_idx` drives the step
+# preview, and reshapes the query - and those are for the builder, not for the
+# published document.
+PUBLIC_METHOD_ARGS = {
+    ("Insights Query v3", "execute"): {"adhoc_filters", "page", "page_size"},
+    ("Insights Query v3", "download_results"): {"format", "adhoc_filters"},
+    ("Insights Dashboard v3", "get_distinct_column_values"): {
+        "query",
+        "column_name",
+        "search_term",
+        "adhoc_filters",
+    },
+    ("Insights Dashboard v3", "track_view"): set(),
+}
 
 
 def is_public_method(doctype: str, method: str):
-    public_methods = {
-        "Insights Query v3": ["execute", "download_results"],
-        "Insights Dashboard v3": ["get_distinct_column_values", "track_view"],
-    }
+    return (doctype, method) in PUBLIC_METHOD_ARGS
 
-    if doctype in public_methods and method in public_methods[doctype]:
-        return True
 
-    return False
+def public_method_args(doctype: str, method: str, args: dict | str | None):
+    """The caller's args, less anything the public contract does not name.
+
+    Dropped rather than refused, so the published document still renders.
+    """
+    allowed = PUBLIC_METHOD_ARGS[(doctype, method)]
+    args = frappe.parse_json(args) or {}
+    return {name: value for name, value in args.items() if name in allowed}
